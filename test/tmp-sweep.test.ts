@@ -1,9 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, mkdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
-import { sweepStaleTempDirs, pruneHistoryDir, TEMP_PREFIX } from '../src/util/tmp.js';
+import {
+  sweepStaleTempDirs,
+  pruneHistoryDir,
+  createCopperheadTempDir,
+  TEMP_PREFIX,
+  TEMP_OWNERSHIP_MARKER_NAME,
+} from '../src/util/tmp.js';
 
 // These exercise the I8 startup sweep. They create real `copperhead-*` dirs
 // under a private root and age them via utimes, so the age gate is tested
@@ -25,8 +31,7 @@ describe('sweepStaleTempDirs (I8: reclaim leaked scratch dirs)', () => {
   });
 
   async function makeAged(suffix: string, ageMs: number, base: number): Promise<string> {
-    const dir = path.join(root, `${TEMP_PREFIX}${suffix}-${process.pid}-${made.length}`);
-    await mkdir(dir, { recursive: true });
+    const dir = await createCopperheadTempDir(`${suffix}-${process.pid}-${made.length}-`, root);
     await writeFile(path.join(dir, 'erc.json'), '{}'); // non-empty, like a real leak
     const when = new Date(base - ageMs);
     await utimes(dir, when, when);
@@ -66,6 +71,66 @@ describe('sweepStaleTempDirs (I8: reclaim leaked scratch dirs)', () => {
 
     expect(removed).not.toContain(foreign);
     expect(existsSync(foreign)).toBe(true);
+  });
+
+  it('never touches unmarked copperhead-* directories even if stale (issue #359)', async () => {
+    const now = 1_000_000_000_000;
+    const victim = path.join(root, `${TEMP_PREFIX}unrelated-user-project`);
+    await mkdir(path.join(victim, '.git'), { recursive: true });
+    await writeFile(path.join(victim, 'DO-NOT-DELETE.txt'), 'unrelated user project');
+    made.push(victim);
+    const when = new Date(now - 24 * 60 * 60 * 1000); // 1 day old
+    await utimes(victim, when, when);
+
+    const removed = await sweepStaleTempDirs(now, undefined, root);
+
+    expect(removed).not.toContain(victim);
+    expect(existsSync(victim)).toBe(true);
+    expect(existsSync(path.join(victim, 'DO-NOT-DELETE.txt'))).toBe(true);
+  });
+
+  it('does not delete directories with invalid ownership marker contents', async () => {
+    const now = 1_000_000_000_000;
+    const fake = path.join(root, `${TEMP_PREFIX}fake-marker-dir`);
+    await mkdir(fake, { recursive: true });
+    await writeFile(path.join(fake, TEMP_OWNERSHIP_MARKER_NAME), 'invalid-marker\n');
+    made.push(fake);
+    const when = new Date(now - 24 * 60 * 60 * 1000); // 1 day old
+    await utimes(fake, when, when);
+
+    const removed = await sweepStaleTempDirs(now, undefined, root);
+
+    expect(removed).not.toContain(fake);
+    expect(existsSync(fake)).toBe(true);
+  });
+
+  it('never follows symlinks matching the copperhead- prefix', async () => {
+    const targetDir = path.join(root, 'target-directory');
+    await mkdir(targetDir, { recursive: true });
+    await writeFile(path.join(targetDir, 'important.txt'), 'do not delete');
+
+    const linkPath = path.join(root, `${TEMP_PREFIX}symlink-candidate`);
+    try {
+      await symlink(targetDir, linkPath, 'dir');
+    } catch {
+      // On Windows without Developer Mode / permissions, symlink creation may fail; skip if not permitted
+      return;
+    }
+    made.push(linkPath);
+
+    const now = 1_000_000_000_000;
+    const when = new Date(now - 24 * 60 * 60 * 1000);
+    try {
+      await utimes(linkPath, when, when);
+    } catch {
+      // utimes on symlink might not be supported on all OSes
+    }
+
+    const removed = await sweepStaleTempDirs(now, undefined, root);
+
+    expect(removed).not.toContain(linkPath);
+    expect(existsSync(linkPath)).toBe(true);
+    expect(existsSync(path.join(targetDir, 'important.txt'))).toBe(true);
   });
 
   it('honours a custom maxAge and returns [] when nothing is stale', async () => {
