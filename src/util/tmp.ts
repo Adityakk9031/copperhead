@@ -150,10 +150,13 @@ export async function sweepStaleTempDirs(now: number, maxAgeMs = DEFAULT_STALE_M
       // Verify positive ownership marker before deletion
       const markerPath = path.join(full, TEMP_OWNERSHIP_MARKER_NAME);
       try {
+        const markerStat = await lstat(markerPath);
+        if (!markerStat.isFile() || markerStat.isSymbolicLink()) continue;
+        if (markerStat.size !== Buffer.byteLength(TEMP_OWNERSHIP_MARKER_CONTENT, 'utf8')) continue;
         const markerContent = await readFile(markerPath, 'utf8');
         if (markerContent !== TEMP_OWNERSHIP_MARKER_CONTENT) continue;
       } catch {
-        // Missing marker or unreadable: not a copperhead-owned scratch dir, leave it untouched
+        // Missing marker, unreadable, or not a regular file: not a copperhead-owned scratch dir
         continue;
       }
 
